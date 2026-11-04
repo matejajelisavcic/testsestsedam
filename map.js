@@ -1,0 +1,229 @@
+// Choropleth map: draws counties once, recolors on metric change.
+(function () {
+  const M = window.MCAP, C = M.C;
+  const NS = "http://www.w3.org/2000/svg";
+
+  // Small hand-tuned nudges (dx, dy in map units) so labels don't collide
+  // with neighboring county names or run outside a narrow county's outline.
+  const LABEL_OFFSET = {
+    Westmoreland: [-6, 14], Allegheny: [-4, -10], Northampton: [10, -6],
+    Bucks: [8, 10], Berks: [0, -6], Dauphin: [-2, 8],
+  };
+
+  // One entry per tab. `value(name)` returns the number to color that county
+  // by; `color` maps it. `year` is the point selected on the timeline: the
+  // projection year uses the model snapshot, an earlier year that cycle's
+  // actual result. A spec carrying `unavailable` has no data for that year and
+  // its tab is disabled, with the string as the reason.
+  function metrics(data, year) {
+    const m = data.metrics, proj = data.meta.proj_year;
+    const YS = M.yearsOf(data), isProj = year === proj;
+    const prev = YS[YS.indexOf(year) - 1];
+    const rows = data.counties.map(c => m[c.name]);
+    const range = fn => { const v = rows.map(fn); return [Math.min(...v), Math.max(...v)]; };
+    const at = (name, y) => M.marginAt(data, name, y);
+
+    // Scales span every year at once, so a shade means the same margin in 2012
+    // as it does in the projection year and the timeline is comparable.
+    const marg = [], swings = [];
+    data.counties.forEach(c => {
+      marg.push(m[c.name].projmarg, m[c.name].basemarg);
+      swings.push(m[c.name].projmarg - m[c.name].basemarg);
+      YS.forEach((y, i) => {
+        const v = at(c.name, y);
+        if (v == null) return;
+        marg.push(v);
+        const p = i > 0 ? at(c.name, YS[i - 1]) : null;
+        if (p != null) swings.push(v - p);
+      });
+    });
+    const bins = M.marginBins(Math.ceil(Math.max(...marg.map(Math.abs)) / 5) * 5);
+    const swingBins = M.marginBins(Math.ceil(Math.max(...swings.map(Math.abs)) * 10) / 10);
+    const partyEnds = ["More Republican", "More Democratic"];
+    const swingEnds = ["Swung Republican", "Swung Democratic"];
+    const frozen = `${proj} model score — no per-year source data, so the timeline does not change it`;
+
+    const marginSpec = (key, title, sub, get, tabLabel) => ({
+      key, title, sub, tabLabel, value: get, color: v => M.binColor(bins, v),
+      legend: { kind: "bins", bins, unit: " pt", ends: partyEnds }, tip: n => M.fmtMargin(get(n)),
+    });
+    const kindSpec = (title, sub, get) => ({
+      key: "kind", title, sub, value: get, color: v => M.kindColor(M.classify(v)),
+      legend: { kind: "cat" }, tip: n => M.fmtMargin(get(n)),
+    });
+    const swingSpec = (title, sub, get, tip) => ({
+      key: "swing", title, sub, value: get, color: v => M.binColor(swingBins, v),
+      legend: { kind: "bins", bins: swingBins, unit: " pt", ends: swingEnds }, tip,
+    });
+    const seq = (key, title, sub, unit, ramp, ends) => {
+      const [lo, hi] = range(r => r[key]);
+      return { key, title, sub, unit, value: n => m[n][key], color: v => ramp((v - lo) / (hi - lo || 1)),
+               legend: { kind: "seq", lo, hi, unit, ramp, ends } };
+    };
+
+    if (!isProj) return {
+      projmarg: marginSpec("projmarg", `Result, ${year}`, `Actual margin, ${year} cycle, percentage points`, n => at(n, year), "Result"),
+      basemarg: { key: "basemarg", title: `Base Margin, ${data.meta.base_year}`, unavailable: frozen },
+      kind: kindSpec(`Red, Blue and Purple Counties, ${year}`,
+        `Purple = ${year} margin inside ${M.PURPLE_BAND} points`, n => at(n, year)),
+      swing: prev
+        ? swingSpec(`Swing, ${prev} to ${year}`, `${year} margin minus ${prev}, points`,
+            n => at(n, year) - at(n, prev), n => M.swingText(at(n, prev), at(n, year)))
+        : { key: "swing", title: "Swing", unavailable: `${year} is the first cycle on the timeline, so there is nothing to compare it with` },
+      logpwd: { key: "logpwd", title: "Population Density Score", unavailable: frozen },
+      elasticity: { key: "elasticity", title: "Elasticity Score", unavailable: frozen },
+      vulcomposite: { key: "vulcomposite", title: "Economic Vulnerability Score", unavailable: frozen },
+    };
+
+    return {
+      projmarg: marginSpec("projmarg", `Projected Margin, ${proj}`, "PROJMARG, percentage points", n => m[n].projmarg),
+      basemarg: marginSpec("basemarg", `Base Margin, ${data.meta.base_year}`, "BASEMARG, percentage points", n => m[n].basemarg),
+      kind: kindSpec("Red, Blue and Purple Counties",
+        `Purple = projected margin inside ${M.PURPLE_BAND} points`, n => m[n].projmarg),
+      swing: swingSpec("Swing, Base to Projected", "PROJMARG minus BASEMARG, points",
+        n => m[n].projmarg - m[n].basemarg, n => M.swingText(m[n].basemarg, m[n].projmarg)),
+      logpwd: seq("logpwd", "Population Density Score", "LOGPWD, 0–10", "", M.seqRamp("#EAF1F0", C.teal, "#12453F"),
+        ["Least dense", "Most dense"]),
+      elasticity: seq("elasticity", "Elasticity Score", "ELASTICITY, 0–2", "", M.seqRamp("#EEF0FC", C.elastic, "#20307A"),
+        ["Least elastic", "Most elastic"]),
+      vulcomposite: seq("vulcomposite", "Economic Vulnerability Score", "Composite score (CEVS), z-score vs state average", "",
+        M.seqRamp("#F5EFE6", C.warn, "#7A3E0C"), ["Least vulnerable", "Most vulnerable"]),
+    };
+  }
+
+  // basemarg is available as a view (#view=basemarg) but not shown as a tab.
+  const TABS = [["projmarg", "Projected Margin"], ["kind", "Red / Blue / Purple"], ["swing", "Swing"],
+                ["logpwd", "Density"], ["elasticity", "Elasticity"], ["vulcomposite", "Vulnerability"]];
+
+  function build(svg, data, onSelect) {
+    const [W, H] = data.meta.view;
+    const base = { x: -6, y: -6, w: W + 12, h: H + 12 };
+    svg.setAttribute("viewBox", `${base.x} ${base.y} ${base.w} ${base.h}`);
+
+    const defs = document.createElementNS(NS, "defs");
+    defs.innerHTML = `<filter id="mapShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#0B0E13" flood-opacity="0.28"/>
+    </filter>`;
+    svg.appendChild(defs);
+
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("filter", "url(#mapShadow)");
+    const paths = {};
+    data.counties.forEach(c => {
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("d", c.path);
+      p.setAttribute("class", "cty");
+      p.setAttribute("tabindex", "0");
+      p.setAttribute("role", "button");
+      p.setAttribute("aria-label", c.name + " County");
+      p.dataset.n = c.name;
+      p.addEventListener("click", () => onSelect(c.name));
+      p.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(c.name); } });
+      p.addEventListener("mouseenter", () => spotlight(c.name));
+      p.addEventListener("mouseleave", clearSpotlight);
+      g.appendChild(p);
+      paths[c.name] = p;
+    });
+    svg.appendChild(g);
+
+    function spotlight(name) {
+      const selName = Object.keys(paths).find(n => paths[n].classList.contains("sel"));
+      Object.entries(paths).forEach(([n, p]) => {
+        const crisp = n === name || n === selName;
+        p.classList.toggle("faded", !crisp);
+        p.classList.toggle("hot", n === name);
+      });
+    }
+    function clearSpotlight() {
+      const selName = Object.keys(paths).find(n => paths[n].classList.contains("sel"));
+      Object.entries(paths).forEach(([n, p]) => {
+        p.classList.remove("hot");
+        p.classList.toggle("faded", !!selName && n !== selName);
+      });
+    }
+    // Called by app.js right after it adds/removes the .sel class, so the
+    // rest of the map blurs behind the selected county even without a hover.
+    function refreshSelection() { clearSpotlight(); }
+
+    // Every county gets a label, sized to its footprint. Small counties
+    // render too small to read by design, to avoid clutter.
+    const lg = document.createElementNS(NS, "g");
+    lg.setAttribute("class", "labels");
+    data.counties.forEach(c => {
+      const bb = paths[c.name].getBBox();
+      const size = Math.max(4.5, Math.min(15, Math.sqrt(bb.width * bb.height) / 9));
+      const [ox, oy] = LABEL_OFFSET[c.name] || [0, 0];
+      const t = document.createElementNS(NS, "text");
+      t.setAttribute("x", c.cx + ox); t.setAttribute("y", c.cy + oy); t.setAttribute("class", "lbl");
+      t.setAttribute("font-size", size.toFixed(1));
+      t.setAttribute("stroke-width", (size * 0.22).toFixed(2));
+      t.textContent = c.name;
+      lg.appendChild(t);
+    });
+    svg.appendChild(lg);
+
+    return { paths, group: g, refreshSelection };
+  }
+
+  // The scale bar replaces the old chip legend: one horizontal bar per metric,
+  // captioned at both ends so the direction (Republican -> Democratic, low -> high)
+  // reads without decoding a swatch key.
+  function scaleEnd(head, sub, side) {
+    return `<span class="end ${side}"><b>${M.esc(head)}</b><em>${M.esc(sub)}</em></span>`;
+  }
+
+  function legendHtml(spec, counts) {
+    const L = spec.legend;
+    const cnt = `<div class="counts"><span><i style="background:${C.dem}"></i>Blue ${counts.Blue}</span><span><i style="background:${C.pur}"></i>Purple ${counts.Purple}</span><span><i style="background:${C.rep}"></i>Red ${counts.Red}</span></div>`;
+    let track, left, right, label;
+    if (L.kind === "cat") {
+      const segs = [[counts.Red, C.rep, "Red"], [counts.Purple, C.pur, "Purple"], [counts.Blue, C.dem, "Blue"]];
+      track = segs.map(([n, col, name]) => `<i style="flex:${n};background:${col}" title="${name}: ${n} counties"></i>`).join("");
+      left = scaleEnd("Republican", `${counts.Red} counties`, "left");
+      right = scaleEnd("Democratic", `${counts.Blue} counties`, "right");
+      label = `${counts.Red} red, ${counts.Purple} purple and ${counts.Blue} blue counties`;
+    } else if (L.kind === "bins") {
+      const outer = (+Math.abs(L.bins[0].max).toFixed(1)).toString();
+      track = L.bins.map((b, i) => `<i style="background:${b.color}" title="${M.esc(M.binLabel(L.bins, i, L.unit))}"></i>`).join("");
+      left = scaleEnd(L.ends[0], `${outer}${L.unit} or more`, "left");
+      right = scaleEnd(L.ends[1], `${outer}${L.unit} or more`, "right");
+      label = `${spec.title}, ${L.ends[0]} on the left to ${L.ends[1]} on the right`;
+    } else {
+      const stops = [0, .25, .5, .75, 1].map(t => `${L.ramp(t)} ${t * 100}%`).join(",");
+      track = `<i style="flex:1;background:linear-gradient(90deg,${stops})"></i>`;
+      left = scaleEnd((+L.lo).toFixed(1), L.ends[0], "left");
+      right = scaleEnd((+L.hi).toFixed(1), L.ends[1], "right");
+      label = `${spec.title} from ${(+L.lo).toFixed(1)} to ${(+L.hi).toFixed(1)}`;
+    }
+    return `<div class="scale" role="img" aria-label="${M.esc(label)}">${left}<div class="track">${track}</div>${right}</div>${cnt}`;
+  }
+
+  function downloadPng(svg, filename) {
+    const clone = svg.cloneNode(true);
+    clone.querySelectorAll(".cty").forEach(p => {
+      p.setAttribute("stroke", p.classList.contains("sel") ? C.ink : "#fff");
+      p.setAttribute("stroke-width", p.classList.contains("sel") ? "2.6" : "0.9");
+    });
+    clone.querySelectorAll(".lbl").forEach(t => {
+      t.setAttribute("style", "font:600 13px Proxinovo,Barlow,Arial,sans-serif;fill:#15181D;paint-order:stroke;stroke:#fff;stroke-width:3px;text-anchor:middle");
+    });
+    const vb = svg.viewBox.baseVal;
+    clone.setAttribute("width", vb.width * 2); clone.setAttribute("height", vb.height * 2);
+    clone.setAttribute("xmlns", NS);
+    const blob = new Blob([new XMLSerializer().serializeToString(clone)], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob), img = new Image();
+    img.onload = () => {
+      const cv = document.createElement("canvas");
+      cv.width = vb.width * 2; cv.height = vb.height * 2;
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = "#F3F4F6"; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      const a = document.createElement("a");
+      a.download = filename; a.href = cv.toDataURL("image/png"); a.click();
+    };
+    img.src = url;
+  }
+
+  M.map = { metrics, TABS, build, legendHtml, downloadPng };
+})();
